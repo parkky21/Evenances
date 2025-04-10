@@ -1,7 +1,5 @@
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
-import 'package:flutter_application_1/models/message.dart';
-import 'package:flutter_application_1/models/chat_user.dart';
 
 class ChatService {
   final FirebaseFirestore _firestore = FirebaseFirestore.instance;
@@ -9,161 +7,132 @@ class ChatService {
 
   // Get current user ID
   String? get currentUserId => _auth.currentUser?.uid;
-  
-  // Get all users
-  Stream<List<ChatUser>> getUsers() {
-    return _firestore
-        .collection('users')
-        .where('id', isNotEqualTo: currentUserId)
-        .snapshots()
-        .map((snapshot) {
-      return snapshot.docs.map((doc) => ChatUser.fromFirestore(doc)).toList();
-    });
+
+  // Create a chat ID from two user IDs
+  String getChatRoomId(String userId1, String userId2) {
+    // Sort IDs to ensure consistent chat room ID regardless of who initiates
+    return userId1.compareTo(userId2) > 0
+        ? '${userId1}_$userId2'
+        : '${userId2}_$userId1';
   }
 
-  // Search users
-  Future<List<ChatUser>> searchUsers(String query) async {
-    // Convert to lowercase for case-insensitive search
-    String searchQuery = query.toLowerCase();
+  // Get or create a chat conversation
+  Future<String> getOrCreateChatRoom(String otherUserId) async {
+    if (currentUserId == null) throw Exception('User not authenticated');
     
-    QuerySnapshot snapshot = await _firestore.collection('users').get();
+    final chatRoomId = getChatRoomId(currentUserId!, otherUserId);
     
-    List<ChatUser> users = snapshot.docs
-        .map((doc) => ChatUser.fromFirestore(doc))
-        .where((user) => 
-            user.id != currentUserId && 
-            (user.name.toLowerCase().contains(searchQuery) || 
-             user.email.toLowerCase().contains(searchQuery)))
-        .toList();
-    
-    return users;
-  }
+    // Check if chat room exists
+    final chatRoomRef = _firestore.collection('chatRooms').doc(chatRoomId);
+    final chatRoom = await chatRoomRef.get();
 
-  // Get user chats (conversations)
-  Stream<List<String>> getUserChats() {
-    return _firestore
-        .collection('chats')
-        .where('participants', arrayContains: currentUserId)
-        .snapshots()
-        .map((snapshot) {
-      return snapshot.docs.map((doc) => doc.id).toList();
-    });
-  }
-
-  // Get chat ID between two users
-  String getChatID(String userId1, String userId2) {
-    // Always put the smaller ID first to ensure consistency
-    return userId1.compareTo(userId2) < 0
-        ? '$userId1-$userId2'
-        : '$userId2-$userId1';
-  }
-
-  // Create a new chat
-  Future<void> createChat(String otherUserId) async {
-    if (currentUserId == null) return;
-    
-    String chatId = getChatID(currentUserId!, otherUserId);
-    
-    // Check if chat already exists
-    DocumentSnapshot chatDoc = await _firestore.collection('chats').doc(chatId).get();
-    
-    if (!chatDoc.exists) {
-      // Create new chat document
-      await _firestore.collection('chats').doc(chatId).set({
-        'participants': [currentUserId, otherUserId],
+    if (!chatRoom.exists) {
+      // Create a new chat room
+      await chatRoomRef.set({
+        'users': [currentUserId, otherUserId],
         'lastMessage': '',
         'lastMessageTime': FieldValue.serverTimestamp(),
+        'createdAt': FieldValue.serverTimestamp(),
       });
     }
+    
+    return chatRoomId;
   }
 
-  // Get chat messages
-  Stream<List<Message>> getChatMessages(String otherUserId) {
-    if (currentUserId == null) return Stream.value([]);
+  // Send a message
+  Future<void> sendMessage(String chatRoomId, String message) async {
+    if (currentUserId == null) throw Exception('User not authenticated');
     
-    String chatId = getChatID(currentUserId!, otherUserId);
+    final timestamp = FieldValue.serverTimestamp();
     
-    return _firestore
-        .collection('chats')
-        .doc(chatId)
+    // Add message to the chat room
+    await _firestore
+        .collection('chatRooms')
+        .doc(chatRoomId)
         .collection('messages')
-        .orderBy('timestamp', descending: true)
-        .snapshots()
-        .map((snapshot) {
-      return snapshot.docs.map((doc) => Message.fromFirestore(doc)).toList();
+        .add({
+          'senderId': currentUserId,
+          'text': message,
+          'timestamp': timestamp,
+          'read': false,
+        });
+
+    // Update last message in chat room
+    await _firestore.collection('chatRooms').doc(chatRoomId).update({
+      'lastMessage': message,
+      'lastMessageTime': timestamp,
     });
   }
 
-  // Send message
-  Future<void> sendMessage(String receiverId, String text) async {
-  if (currentUserId == null) return;
-  
-  User? currentUser = _auth.currentUser;
-  if (currentUser == null) return;
-  
-  String chatId = getChatID(currentUserId!, receiverId);
-  
-  // Get user data for metadata
-  DocumentSnapshot userDoc = await _firestore.collection('users').doc(currentUserId).get();
-  Map<String, dynamic> userData = userDoc.data() as Map<String, dynamic>;
-  String senderName = userData['name'] ?? '';
-  String senderImage = userData['imageUrl'] ?? '';
-  
-  // Create message
-  Message message = Message(
-    senderId: currentUserId!,
-    senderName: senderName,
-    senderImage: senderImage,
-    receiverId: receiverId,
-    text: text,
-    timestamp: Timestamp.now(),
-    id: '', // Will be assigned by Firestore
-  );
-    
-    // Add message to chat
-    await _firestore
-      .collection('chats')
-      .doc(chatId)
-      .collection('messages')
-      .add(message.toMap());
-  
-  // Update chat metadata
-  await _firestore.collection('chats').doc(chatId).update({
-    'lastMessage': text,
-    'lastMessageTime': FieldValue.serverTimestamp(),
-  });
-  
-  // Update or create user's chat reference - for current user
-  await _firestore
-      .collection('users')
-      .doc(currentUserId)
-      .collection('chats')
-      .doc(receiverId)
-      .set({
-    'userId': receiverId,
-    'lastMessage': text,
-    'lastMessageTime': FieldValue.serverTimestamp(),
-  }, SetOptions(merge: true));
-  
-  // Update or create user's chat reference - for other user
-  await _firestore
-      .collection('users')
-      .doc(receiverId)
-      .collection('chats')
-      .doc(currentUserId)
-      .set({
-    'userId': currentUserId,
-    'lastMessage': text,
-    'lastMessageTime': FieldValue.serverTimestamp(),
-  }, SetOptions(merge: true));
-}
+  // Stream of messages for a specific chat room
+  Stream<QuerySnapshot> getMessages(String chatRoomId) {
+    return _firestore
+        .collection('chatRooms')
+        .doc(chatRoomId)
+        .collection('messages')
+        .orderBy('timestamp', descending: false)
+        .snapshots();
+  }
 
-  // Get user by ID
-  Future<ChatUser?> getUserById(String userId) async {
-    DocumentSnapshot doc = await _firestore.collection('users').doc(userId).get();
-    if (doc.exists) {
-      return ChatUser.fromFirestore(doc);
+  // Stream of all chat rooms for current user
+  Stream<QuerySnapshot> getChatRooms() {
+    if (currentUserId == null) throw Exception('User not authenticated');
+    
+    return _firestore
+        .collection('chatRooms')
+        .where('users', arrayContains: currentUserId)
+        .orderBy('lastMessageTime', descending: true)
+        .snapshots();
+  }
+
+  // Mark messages as read
+  Future<void> markMessagesAsRead(String chatRoomId, String senderId) async {
+    if (currentUserId == null || currentUserId == senderId) return;
+    
+    final messagesQuery = await _firestore
+        .collection('chatRooms')
+        .doc(chatRoomId)
+        .collection('messages')
+        .where('senderId', isEqualTo: senderId)
+        .where('read', isEqualTo: false)
+        .get();
+
+    final batch = _firestore.batch();
+    for (var doc in messagesQuery.docs) {
+      batch.update(doc.reference, {'read': true});
     }
-    return null;
+    
+    await batch.commit();
+  }
+
+  // Get user details
+  Future<Map<String, dynamic>?> getUserDetails(String userId) async {
+    final userDoc = await _firestore.collection('users').doc(userId).get();
+    return userDoc.data();
+  }
+
+  // Update user online status
+  Future<void> updateUserStatus(bool isOnline) async {
+    if (currentUserId == null) return;
+    
+    await _firestore.collection('users').doc(currentUserId).update({
+      'online': isOnline,
+      'lastSeen': FieldValue.serverTimestamp(),
+    });
+  }
+
+  // Count unread messages
+  Future<int> getUnreadMessageCount(String chatRoomId) async {
+    if (currentUserId == null) return 0;
+    
+    final querySnapshot = await _firestore
+        .collection('chatRooms')
+        .doc(chatRoomId)
+        .collection('messages')
+        .where('senderId', isNotEqualTo: currentUserId)
+        .where('read', isEqualTo: false)
+        .get();
+    
+    return querySnapshot.docs.length;
   }
 }
